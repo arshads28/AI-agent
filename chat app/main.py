@@ -1,131 +1,167 @@
-import json
 import logging
+import json
 import uvicorn
-from fastapi import FastAPI
+import aiosqlite
+from fastapi import FastAPI, HTTPException, Request # <-- Add Request
+from fastapi.responses import StreamingResponse, HTMLResponse, RedirectResponse # <-- Add RedirectResponse
 from pydantic import BaseModel
-from sse_starlette.sse import EventSourceResponse
-from dotenv import load_dotenv
-from langchain_core.messages import AIMessageChunk
-from typing import Optional
+from langchain_core.messages import HumanMessage
+from contextlib import asynccontextmanager
 
-# Import the compiled LangGraph app
-from agent import app as langgraph_app
+# Import the graph definition and the async checkpointer
+from agent import graph_definition
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from fastapi.staticfiles import StaticFiles # <-- Add StaticFiles
 
-# Load environment variables from .env file
-load_dotenv()
-
-# --- Setup Logging ---
-# This provides visibility into what's happening
-logging.basicConfig(
-    level=logging.INFO, 
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+# Setup logging
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- FastAPI App Initialization ---
-app = FastAPI(
-    title="LangGraph FastAPI Agent",
-    description="A production-level chat agent using FastAPI and LangGraph with SSE streaming.",
-    version="1.0.0",
-)
+# This will hold our compiled-with-persistence app
+langgraph_app = None
 
-# --- Pydantic Models ---
-# These models define the expected request/response JSON structures
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """
+    Async context manager for FastAPI lifespan events.
+    This is the new way to handle startup/shutdown in modern FastAPI.
+    """
+    global langgraph_app
+    logger.info("Application startup...")
+    
+    # Create the async connection
+    conn = await aiosqlite.connect("checkpoints.sqlite")
+    
+    # Pass the connection to the AsyncSqliteSaver
+    memory = AsyncSqliteSaver(conn=conn)
+    
+    # Compile the graph with the checkpointer
+    langgraph_app = graph_definition.compile(checkpointer=memory)
+    
+    logger.info("LangGraph app compiled with persistence.")
+    
+    yield  # This is where the application runs
+    
+    # --- Shutdown ---
+    await conn.close()
+    logger.info("Database connection closed. Application shutdown.")
+
+# Pass the lifespan context manager to the FastAPI app
+app = FastAPI(lifespan=lifespan)
+
+# --- Additions ---
+# Mount the current directory ('.') to serve static files from '/static'
+# This is how the server will find and serve your index.html
+app.mount("/static", StaticFiles(directory="."), name="static")
+# --- End Additions ---
+
+
 class ChatRequest(BaseModel):
-    """Request model for the chat endpoint"""
-    user_message: str
-    model_name: Optional[str] = None # Allow client to specify model
+    """Pydantic model for a chat request body."""
+    input: str
+    model_name: str = "string"  # Default value
 
-# --- SSE Streaming Generator ---
-async def stream_generator(thread_id: str, message: str, model_name: str | None = None):
+@app.get("/")
+async def get_root(request: Request): # <-- Add Request
+    """Redirects the root URL '/' to our static 'index.html' file."""
+    return RedirectResponse(url="/static/index.html") # <-- Updated this function
+
+async def stream_generator(thread_id: str, request: ChatRequest):
     """
-    This is the core generator function that streams events from LangGraph.
-    It yields JSON strings formatted for Server-Sent Events (SSE).
+    Generator function to stream LangGraph events.
     """
-    logger.info(f"Starting stream for thread: {thread_id}, model: {model_name}")
+    global langgraph_app
+    if langgraph_app is None:
+        logger.error("Graph app is not initialized!")
+        yield "data: {\"error\": \"Graph app not initialized\"}\n\n"
+        return
+
+    # Configuration for the graph:
+    # 'thread_id' is the key for persistence
+    # 'model_name' is passed to our agent_node
+    config = {
+        "configurable": {
+            "thread_id": thread_id,
+            "model_name": request.model_name
+        }
+    }
+    
+    logger.info(f"Starting stream for thread: {thread_id}, model: {request.model_name}")
+    
+    # --- FIX: Add flag to track streaming ---
+    # This prevents sending the full message at the end if we've already streamed chunks.
+    streamed_content = False
+    # --- END FIX ---
+    
     try:
-        # The config dict specifies the 'thread_id' for persistence
-        # and optionally the 'model_name'
-        config_payload = {"thread_id": thread_id}
-        if model_name:
-            config_payload["model_name"] = model_name
-            
-        config = {"configurable": config_payload}
-        
-        # This is the input message for the graph
-        input_messages = {"messages": [("user", message)]}
-
-        # `astream_events` streams *all* events from the graph (LLM, tools, etc.)
-        # `stream_mode="values"` streams the output of each node *as it's produced*
+        # astream_events streams all events (nodes, tools, state changes)
         async for event in langgraph_app.astream_events(
-            input_messages,
+            {"messages": [HumanMessage(content=request.input)]},
             config,
             version="v2",
-            stream_mode="values"
         ):
-            event_type = event["event"]
-            event_data = event["data"]
+            # We only stream 'on_chat_model_stream' events
+            # which contain the LLM's streaming output chunks
+            if event["event"] == "on_chat_model_stream":
+                chunk = event["data"]["chunk"]
+                if chunk.content:
+                    # --- FIX: Mark that we have streamed content ---
+                    streamed_content = True
+                    # --- END FIX ---
+                    
+                    # Format as Server-Sent Event (SSE)
+                    data = json.dumps({"content": chunk.content})
+                    yield f"data: {data}\n\n"
             
-            logger.debug(f"Event: {event_type}, Data: {event_data}")
-
-            # Stream LLM tokens as they are generated
-            if event_type == "on_llm_stream":
-                chunk = event_data.get("chunk")
-                if isinstance(chunk, AIMessageChunk) and chunk.content:
-                    # Yield a JSON object with type 'token'
-                    yield json.dumps({"type": "token", "data": chunk.content})
+            # --- FIX: Handle non-streaming responses from the agent ---
+            # Check for the end of the 'agent' node
+            # This handles cases where the model *doesn't* stream
+            # (e.g., it returns a tool call, or a short, non-streamed message)
+            if event["event"] == "on_chain_end" and event["name"] == "agent":
+                # If we haven't streamed any content yet, and
+                # the final agent output has content, send it as a single chunk.
+                if not streamed_content:
+                    output = event["data"].get("output", {})
+                    messages = output.get("messages", [])
+                    if messages:
+                        last_message = messages[-1]
+                        # Check if it's a valid message with content
+                        if hasattr(last_message, 'content') and last_message.content:
+                            logger.info(f"Thread {thread_id}: Yielding non-streamed agent output.")
+                            data = json.dumps({"content": last_message.content})
+                            yield f"data: {data}\n\n"
+                            # Mark as streamed to be safe
+                            streamed_content = True 
+            # --- END FIX ---
             
-            # Stream tool calls
-            elif event_type == "on_tool_start":
-                yield json.dumps({
-                    "type": "tool_start", 
-                    "name": event["name"], 
-                    "input": event_data.get("input")
-                })
+            # Log node starts for debugging
+            if event["event"] == "on_chain_start" and "agent" in event["name"]:
+                logger.info(f"Thread {thread_id}: 'agent' node started")
             
-            # Stream tool outputs
-            elif event_type == "on_tool_end":
-                output = event_data.get("output")
-                # Truncate large tool outputs for cleaner logs/streaming
-                if isinstance(output, str) and len(output) > 250:
-                     output = output[:250] + "... (truncated)"
-                
-                yield json.dumps({
-                    "type": "tool_end", 
-                    "name": event["name"], 
-                    "output": output
-                })
-        
-        # Signal the end of the conversation turn
-        logger.info(f"Finished stream for thread: {thread_id}")
-        yield json.dumps({"type": "end"})
+            # Log tool calls for debugging
+            if event["event"] == "on_tool_start":
+                logger.info(f"Thread {thread_id}: Tool call started: {event['name']}")
 
     except Exception as e:
         logger.error(f"Error in stream for thread {thread_id}: {e}", exc_info=True)
-        # Signal an error to the client
-        yield json.dumps({"type": "error", "data": str(e)})
+        # Stream an error event to the client
+        data = json.dumps({"error": str(e)})
+        yield f"data: {data}\n\n"
+    finally:
+        logger.info(f"Stream ended for thread: {thread_id}")
 
-# --- FastAPI Endpoints ---
 @app.post("/chat/stream/{thread_id}")
 async def chat_stream(thread_id: str, request: ChatRequest):
     """
-    Main chat endpoint.
-    Takes a `thread_id` and a `ChatRequest` body.
-    The body can optionally specify a `model_name`.
-    Streams responses back using Server-Sent Events (SSE).
+    POST endpoint to stream chat responses using SSE.
     """
-    generator = stream_generator(thread_id, request.user_message, request.model_name)
-    return EventSourceResponse(generator, media_type="text/event-stream")
+    logger.info(f"Received request for thread: {thread_id}")
+    return StreamingResponse(
+        stream_generator(thread_id, request),
+        media_type="text/event-stream"
+    )
 
-@app.get("/")
-async def root():
-    """
-    Root endpoint for health checks.
-    """
-    return {"message": "LangGraph Agent Server is running. POST to /chat/stream/{thread_id}"}
-
-# --- Main execution ---
 if __name__ == "__main__":
-    # This allows running the app directly with `python main.py`
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # This is the entry point for running the server directly
+    uvicorn.run(app, host="127.0.0.1", port=8000)
 
