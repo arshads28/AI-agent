@@ -1,24 +1,31 @@
 import os
 import logging
+# We no longer need the 'sqlite3' import
 from typing import Annotated, Literal
 
 from langchain_openai import ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.runnables import RunnableConfig
 from typing_extensions import TypedDict
-from langgraph.checkpoint.sqlite import SqliteSaver
+# We no longer need the checkpointer import here
 from langgraph.graph import StateGraph, END, START
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 
 from tools import tools
 
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
+
 # Setup logging
 logger = logging.getLogger(__name__)
 
 class MessagesState(TypedDict):
     """
-    The state for our graph is a list of messages.
+    The canonical state for our graph. It's a dictionary with one
+    key, 'messages', which is a list.
     'add_messages' ensures that new messages are appended to the list,
     not overwritten.
     """
@@ -33,7 +40,7 @@ available_models = {}
 default_model = None
 
 # Initialize OpenAI model
-if os.environ.get("OPENAI_API_KEY"):
+if os.getenv("OPENAI_API_KEY"):
     openai_model = ChatOpenAI(model="gpt-4o", streaming=True)
     openai_with_tools = openai_model.bind_tools(tools)
     available_models["openai"] = openai_with_tools
@@ -44,8 +51,14 @@ else:
     logger.warning("OPENAI_API_KEY not set. OpenAI model will not be available.")
 
 # Initialize Gemini model
-if os.environ.get("GEMINI_API_KEY"):
-    gemini_model = ChatGoogleGenerativeAI(model="gemini-1.5-flash-latest", streaming=True)
+gemini_api_key = os.getenv("GEMINI_API_KEY")
+if gemini_api_key:
+    gemini_model = ChatGoogleGenerativeAI(
+        model="models/gemini-2.5-flash", 
+        streaming=True, 
+        google_api_key=gemini_api_key
+    )
+    
     gemini_with_tools = gemini_model.bind_tools(tools)
     available_models["gemini"] = gemini_with_tools
     if not default_model:
@@ -88,7 +101,8 @@ def agent_node(state: MessagesState, config: RunnableConfig):
     return {"messages": [response]}
 
 # The ToolNode is a prebuilt node that executes tools
-# It takes the tool calls from the last AIMessage and runs them
+# It takes the list of tools, finds the one(s) the agent called,
+# executes them, and returns the output
 tool_node = ToolNode(tools)
 
 
@@ -99,7 +113,8 @@ tool_node = ToolNode(tools)
 def should_continue(state: MessagesState) -> Literal["call_tools", "__end__"]:
     """
     Conditional edge logic.
-    It checks the last message in the state.
+    This function is called after the 'agent' node.
+    It inspects the last message in the state:
     - If it has tool calls, it routes to 'call_tools'.
     - Otherwise, it ends the graph execution.
     """
@@ -120,6 +135,7 @@ workflow.add_node("agent", agent_node)
 workflow.add_node("call_tools", tool_node)
 
 # 3. Define the entry point
+# This tells the graph where to start
 workflow.add_edge(START, "agent")
 
 # 4. Add the conditional edge
@@ -138,16 +154,12 @@ workflow.add_edge("call_tools", "agent")
 
 
 # ---------------------------------
-# Compile the graph with persistence
+# Export the graph DEFINITION
 # ---------------------------------
 
-# SqliteSaver.from_conn_string(":memory:") can be used for in-memory persistence
-# For production, we use a file to persist state across server restarts
-memory = SqliteSaver.from_conn_string("checkpoints.sqlite")
-
-# `compile()` creates a runnable instance of the graph
-# We pass the checkpointer to enable persistence
-app = workflow.compile(checkpointer=memory)
-
-# This compiled 'app' is what we'll use in our FastAPI server
+# *** THIS IS THE CHANGE ***
+# We no longer compile here or set up memory.
+# We will export the raw graph definition.
+# It will be compiled in main.py during the server startup.
+graph_definition = workflow
 

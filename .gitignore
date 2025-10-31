@@ -5,8 +5,13 @@ node_modules/
 dist/
 build/
 
-# Ignore environment files
-# .env
+# Ignore SQLite checkpoints
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+Ignore environment files
+.env
 
 # Ignore OS-specific files
 .DS_Store
