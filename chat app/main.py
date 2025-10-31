@@ -90,6 +90,7 @@ async def stream_generator(thread_id: str, request: ChatRequest):
     }
     
     logger.info(f"Starting stream for thread: {thread_id}, model: {request.model_name}")
+    logger.info(f"User message is @@@@@@@ ------->>>> {request.input}")
     
     # --- FIX: Add flag to track streaming ---
     # This prevents sending the full message at the end if we've already streamed chunks.
@@ -108,34 +109,49 @@ async def stream_generator(thread_id: str, request: ChatRequest):
             if event["event"] == "on_chat_model_stream":
                 chunk = event["data"]["chunk"]
                 if chunk.content:
-                    # --- FIX: Mark that we have streamed content ---
+                    
                     streamed_content = True
-                    # --- END FIX ---
+                   
                     
                     # Format as Server-Sent Event (SSE)
+                    logger.info(f" ai response is @@@@@@@ : {chunk.content}")
                     data = json.dumps({"content": chunk.content})
                     yield f"data: {data}\n\n"
             
-            # --- FIX: Handle non-streaming responses from the agent ---
+            
             # Check for the end of the 'agent' node
             # This handles cases where the model *doesn't* stream
             # (e.g., it returns a tool call, or a short, non-streamed message)
             if event["event"] == "on_chain_end" and event["name"] == "agent":
-                # If we haven't streamed any content yet, and
-                # the final agent output has content, send it as a single chunk.
                 if not streamed_content:
                     output = event["data"].get("output", {})
                     messages = output.get("messages", [])
                     if messages:
                         last_message = messages[-1]
-                        # Check if it's a valid message with content
+                        
                         if hasattr(last_message, 'content') and last_message.content:
-                            logger.info(f"Thread {thread_id}: Yielding non-streamed agent output.")
-                            data = json.dumps({"content": last_message.content})
-                            yield f"data: {data}\n\n"
-                            # Mark as streamed to be safe
-                            streamed_content = True 
-            # --- END FIX ---
+                            final_content = ""
+                            content_to_process = last_message.content
+
+                            if isinstance(content_to_process, str):
+                                # Case 1: Content is a simple string (your "Success" case)
+                                final_content = content_to_process
+                            elif isinstance(content_to_process, list):
+                                # Case 2: Content is a list of parts (your "Failure" case)
+                                for part in content_to_process:
+                                    if isinstance(part, str):
+                                        final_content += part
+                                    elif isinstance(part, dict) and part.get('type') == 'text':
+                                        final_content += part.get('text', '')
+                            
+                            # Only yield if we actually processed some content
+                            if final_content:
+                                logger.info(f"Thread {thread_id}: Yielding non-streamed, processed agent output.")
+                                logger.info(f"ai response is non streamed @@@@@@@ :{final_content} ")
+                                data = json.dumps({"content": final_content})
+                                yield f"data: {data}\n\n"
+                                streamed_content = True 
+            
             
             # Log node starts for debugging
             if event["event"] == "on_chain_start" and "agent" in event["name"]:
@@ -166,5 +182,11 @@ async def chat_stream(thread_id: str, request: ChatRequest):
 
 if __name__ == "__main__":
     # This is the entry point for running the server directly
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(
+        "main:app", 
+        host="127.0.0.1", 
+        port=8000, 
+        reload=True, 
+        log_config="logging.yaml"
+    )
 
