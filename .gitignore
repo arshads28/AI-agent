@@ -1,0 +1,24 @@
+# Ignore node modules
+node_modules/
+
+# Ignore build outputs
+dist/
+build/
+
+# Ignore environment files
+# .env
+
+# Ignore OS-specific files
+.DS_Store
+Thumbs.db
+
+# Ignore logs
+*.log
+
+# Ignore virtual environment
+.venv/
+
+# (Optional) Other common ignores
+__pycache__/
+*.pyc
+.env

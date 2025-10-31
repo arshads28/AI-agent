@@ -1,6 +1,10 @@
-from typing import Annotated
+import os
+import logging
+from typing import Annotated, Literal
 
 from langchain_openai import ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.runnables import RunnableConfig
 from typing_extensions import TypedDict
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import StateGraph, END, START
@@ -8,6 +12,9 @@ from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 
 from tools import tools
+
+# Setup logging
+logger = logging.getLogger(__name__)
 
 class MessagesState(TypedDict):
     """
@@ -18,25 +25,65 @@ class MessagesState(TypedDict):
     messages: Annotated[list, add_messages]
 
 
-# Initialize the LLM
-# We use streaming to make it easier to stream tokens back to the client
-model = ChatOpenAI(model="gpt-4o", streaming=True)
+# ---------------------------------
+# Initialize Models and Tools
+# ---------------------------------
 
-# Bind the tools to the model
-# This tells the model what tools it can call
-model_with_tools = model.bind_tools(tools)
+available_models = {}
+default_model = None
+
+# Initialize OpenAI model
+if os.environ.get("OPENAI_API_KEY"):
+    openai_model = ChatOpenAI(model="gpt-4o", streaming=True)
+    openai_with_tools = openai_model.bind_tools(tools)
+    available_models["openai"] = openai_with_tools
+    if not default_model:
+        default_model = "openai"
+    logger.info("OpenAI model loaded.")
+else:
+    logger.warning("OPENAI_API_KEY not set. OpenAI model will not be available.")
+
+# Initialize Gemini model
+if os.environ.get("GEMINI_API_KEY"):
+    gemini_model = ChatGoogleGenerativeAI(model="gemini-1.5-flash-latest", streaming=True)
+    gemini_with_tools = gemini_model.bind_tools(tools)
+    available_models["gemini"] = gemini_with_tools
+    if not default_model:
+        default_model = "gemini"
+    logger.info("Gemini model loaded.")
+else:
+    logger.warning("GEMINI_API_KEY not set. Gemini model will not be available.")
+
+if not available_models:
+    raise RuntimeError("No models were successfully loaded! Please set OPENAI_API_KEY or GEMINI_API_KEY.")
+
+logger.info(f"Default model set to: {default_model}")
 
 # ---------------------------------
 # Define the graph nodes
 # ---------------------------------
 
-def agent_node(state: MessagesState):
+def agent_node(state: MessagesState, config: RunnableConfig):
     """
     The primary node that calls the LLM.
+    It checks the config for a specified model, otherwise uses the default.
     It takes the current state (list of messages) and invokes the model.
     The model can respond with a message or a tool call.
     """
-    response = model_with_tools.invoke(state["messages"])
+    # Get model_name from config, fallback to default
+    model_name = config.get("configurable", {}).get("model_name", default_model)
+    
+    # Get the model from our available models, or use the default if invalid
+    model = available_models.get(model_name)
+    if not model:
+        logger.warning(f"Invalid model_name: {model_name}. Falling back to default: {default_model}")
+        model = available_models[default_model]
+    
+    logger.info(f"Using model: {model_name}")
+    
+    # Invoke the model with the current state
+    response = model.invoke(state["messages"])
+    
     # The response is added to the state via the 'add_messages' annotator
     return {"messages": [response]}
 
@@ -49,7 +96,7 @@ tool_node = ToolNode(tools)
 # Define the graph edges
 # ---------------------------------
 
-def should_continue(state: MessagesState):
+def should_continue(state: MessagesState) -> Literal["call_tools", "__end__"]:
     """
     Conditional edge logic.
     It checks the last message in the state.
@@ -103,3 +150,4 @@ memory = SqliteSaver.from_conn_string("checkpoints.sqlite")
 app = workflow.compile(checkpointer=memory)
 
 # This compiled 'app' is what we'll use in our FastAPI server
+
