@@ -14,8 +14,11 @@ from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from fastapi.staticfiles import StaticFiles # <-- Add StaticFiles
 
 # Setup logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("agent")
+
+# logging.basicConfig(level=logging.INFO)
+
+# logger = logging.getLogger(__name__)
 
 # This will hold our compiled-with-persistence app
 langgraph_app = None

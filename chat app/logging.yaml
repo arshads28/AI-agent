@@ -1,0 +1,58 @@
+version: 1
+disable_existing_loggers: False
+
+formatters:
+  # A simple format for console output
+  simple:
+    format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  
+  # A more detailed format for file output, including module and line number
+  detailed:
+    format: "%(asctime)s - %(name)s - %(levelname)s - [%(filename)s:%(lineno)d] - %(message)s"
+
+handlers:
+  # Handler for console output
+  console:
+    class: logging.StreamHandler
+    level: DEBUG
+    formatter: simple
+    stream: ext://sys.stdout
+
+  # Handler for writing to a rotating log file
+  file:
+    # Uses RotatingFileHandler to keep log files from growing indefinitely
+    class: logging.handlers.RotatingFileHandler
+    level: INFO
+    formatter: detailed
+    # The path to your log file
+    filename: agent.log
+    # Max size of 10MB per file
+    maxBytes: 10485760 
+    # Keep up to 3 old log files
+    backupCount: 3
+    encoding: utf8
+
+loggers:
+  # Logger for your own application
+  app:
+    level: DEBUG
+    handlers: [console, file]
+    # Set to False to prevent logs from propagating to the root logger
+    propagate: False
+
+  # Logger for Uvicorn's access logs
+  uvicorn.access:
+    level: INFO
+    handlers: [console, file]
+    propagate: False
+
+  # Logger for Uvicorn's error logs
+  uvicorn.error:
+    level: ERROR
+    handlers: [console, file]
+    propagate: False
+
+# The root logger (captures all other logs)
+root:
+  level: INFO
+  handlers: [console, file]
