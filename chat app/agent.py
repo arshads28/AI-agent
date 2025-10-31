@@ -48,7 +48,7 @@ if os.getenv("OPENAI_API_KEY"):
         default_model = "openai"
     logger.info("OpenAI model loaded.")
 else:
-    logger.warning("OPENAI_API_KEY not set. OpenAI model will not be available.")
+    logger.warning("OPENAI_API_KEY not set. OpenAI model will not be available.") 
 
 # Initialize Gemini model
 gemini_api_key = os.getenv("GEMINI_API_KEY")
